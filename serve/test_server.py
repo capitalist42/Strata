@@ -5243,6 +5243,53 @@ class SilentEngine(unittest.TestCase):
         engine.proc.kill.assert_called_once()
         self.assertFalse(engine.alive())
 
+    def test_a_closed_command_pipe_is_the_engine_gone(self):
+        # close() shuts stdin while the process still looks alive.  The write raises ValueError
+        # ('I/O operation on closed file.'), which the request path used to print as the engine's own ERR line.
+        engine = self.bare(30)
+        engine.proc.stdin.close()
+        with self.assertRaises(EngineDied) as cm:
+            next(engine.generate([1], 8, {}, threading.Event()))
+        self.assertIn("stopped unexpectedly", str(cm.exception))
+        self.assertNotIn("I/O operation on closed file", str(cm.exception))
+        self.assertFalse(engine.alive())                          # the next request starts it again
+
+    def test_stop_after_the_command_pipe_closed(self):
+        engine = self.bare(30, can_stop=True)
+        engine.lines.put("T 5")
+        engine.lines.put("DONE 1 1 0 1 stop")
+        gen = engine.generate([1], 8, {}, threading.Event())
+        self.assertEqual(next(gen), 5)
+        engine.proc.stdin.close()
+        gen.close()                                               # STOP hits the closed pipe and must not raise
+        self.assertFalse(engine.alive())
+
+    def test_send_after_the_command_pipe_closed(self):
+        engine = self.bare(30)
+        engine.wlock = threading.Lock()
+        engine.proc.stdin.close()
+        with self.assertRaises(EngineDied) as cm:
+            engine._send("BGEN 0 8")
+        self.assertIn("stopped unexpectedly", str(cm.exception))
+        self.assertFalse(engine.alive())
+
+    def test_an_err_line_is_still_the_engines_error(self):
+        engine = self.bare(30)
+        engine.lines.put("ERR prompt exceeds context")
+        with self.assertRaisesRegex(ValueError, "prompt exceeds context"):
+            next(engine.generate([1], 8, {}, threading.Event()))
+        self.assertTrue(engine.alive())                           # a refused request does not end the process
+
+    def test_closed_stdout_ends_the_reader(self):
+        engine = self.bare(30)
+        engine.proc.stdout = io.StringIO()
+        engine.proc.stdout.close()
+        engine.slot_q = []
+        engine.ended = False
+        engine._pump()
+        self.assertTrue(engine.ended)
+        self.assertIsNone(engine.lines.get_nowait())
+
     def test_frozen_engine_is_ended_by_the_stall_watchdog(self):
         # #1317 part 2: silent AND no CPU / disk work for the stall window -> ended, long before engine_silence_s
         from serve import server

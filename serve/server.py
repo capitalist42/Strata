@@ -1188,7 +1188,7 @@ class StrataEngine:
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
         line = None
-        for line in proc.stdout:
+        for line in self._stdout_lines(proc):
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -1297,6 +1297,30 @@ class StrataEngine:
             if not done:
                 out.put(None)
 
+    @staticmethod
+    def _stdout_lines(proc):
+        """The engine's stdout.  close() closing it raises ValueError ('I/O operation on closed file.'), not OSError;
+        that ends the read the same way an exit's EOF does, so the request sees None instead of waiting out the silence."""
+        try:
+            yield from proc.stdout
+        except (OSError, ValueError):
+            return
+
+    def _stdin_lost(self, exc: BaseException, proc) -> bool:
+        """True when `exc` is from a command pipe close() has already closed.
+
+        A write then raises ValueError ('I/O operation on closed file.'), not the OSError a broken pipe raises.
+        That is this process going away (shutdown or restart), not an ERR line the engine reported.  Marks it ended
+        when it is still the current process, so the next request starts another instead of writing the closed pipe."""
+        if not isinstance(exc, ValueError):
+            return False
+        stdin = getattr(proc, "stdin", None) if proc is not None else None
+        if stdin is not None and not getattr(stdin, "closed", False):
+            return False
+        if self.proc is proc:
+            self.ended = True
+        return True
+
     def restart(self, tries: int = 3):
         """Start the engine again (the same command) after it died; the new process has its own line queue.
         close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
@@ -1361,8 +1385,16 @@ class StrataEngine:
         with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
-        self.proc.stdin.flush()
+        proc = self.proc
+        try:
+            proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
+            proc.stdin.flush()
+        except (OSError, AttributeError):
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        except ValueError as e:
+            if not self._stdin_lost(e, proc):
+                raise
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         deadline = time.time() + timeout
         while True:
             try:
@@ -1467,11 +1499,17 @@ class StrataEngine:
 
     def _send(self, text: str):
         btrace("send>", text[:60])
+        proc = None
         try:
             with self.wlock:
-                self.proc.stdin.write(text + "\n")
-                self.proc.stdin.flush()
+                proc = self.proc
+                proc.stdin.write(text + "\n")
+                proc.stdin.flush()
         except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        except ValueError as e:                          # close() already closed it: not an ERR line from the engine
+            if not self._stdin_lost(e, proc):
+                raise
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
     def _control(self, cancel, on_token, stop_when=None, on_quiet=None):
@@ -2198,10 +2236,15 @@ class StrataEngine:
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        proc = self.proc
         try:
-            self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-            self.proc.stdin.flush()
-        except OSError:                                  # the pipe is gone: the engine died (not the client)
+            proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+            proc.stdin.flush()
+        except (OSError, AttributeError):                # the pipe is gone: the engine died (not the client)
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        except ValueError as e:                          # close() already closed it ('I/O operation on closed file.')
+            if not self._stdin_lost(e, proc):
+                raise
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
@@ -2279,12 +2322,16 @@ class StrataEngine:
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
-                if self.can_stop:
+                proc = self.proc
+                if self.can_stop and proc is not None:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
+                        proc.stdin.write("STOP\n")
+                        proc.stdin.flush()
                     except OSError:
                         pass
+                    except ValueError as e:               # the pipe was closed under us: the request still ends
+                        if not self._stdin_lost(e, proc):
+                            raise
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
                 # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
                 # chunk is seen after it); an older one runs on to max_new, so each line only has to come in time.
@@ -2372,10 +2419,15 @@ class StrataEngine:
         that never ends is still ended."""
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
+        proc = self.proc
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
-            self.proc.stdin.flush()
-        except OSError:
+            proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            proc.stdin.flush()
+        except (OSError, AttributeError):
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        except ValueError as e:
+            if not self._stdin_lost(e, proc):
+                raise
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
