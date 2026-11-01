@@ -12,6 +12,8 @@
 #include <immintrin.h>
 #if defined(_MSC_VER)
 #include <intrin.h>   // __cpuidex, __rdtsc (STRATA_POOL_UMWAIT)
+#else
+#include <cpuid.h>
 #endif
 
 #include <cstdio>
@@ -35,6 +37,24 @@
 namespace strata::kernels::cpu {
 
 namespace {
+// AuthenticAMD. Zen 2 and Zen 3 have no AVX-512; their per-core L3 is a CCX, so slicing one expert across every
+// worker reads the blob from several CCXs and pays the kernel's per-call setup on every slice.
+bool amd_no_avx512() {
+    static const bool v = [] {
+        unsigned r[4] = {};
+#if defined(_MSC_VER)
+        int x[4];
+        __cpuid(x, 0);
+        for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+        __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
+#endif
+        const bool amd = r[1] == 0x68747541u && r[3] == 0x69746e65u && r[2] == 0x444d4163u;
+        return amd && !cpu_avx512_ok();
+    }();
+    return v;
+}
+
 // STRATA_POOL_UMWAIT=<TSC cycles> (experimental, x86 WAITPKG only): a parked worker waits with UMONITOR/UMWAIT on the
 // epoch's cache line instead of spinning on _mm_pause.  It wakes when the host publishes (a write to that line) or
 // after the cycles, in the light C0.1 state; on a laptop the CPU then gives back the power the spin took, which the
@@ -1356,6 +1376,22 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+int ExpertPool::whole_expert_tasks(int64_t rows, int experts) const {
+    // STRATA_POOL_WHOLE=0 keeps the fine row split. =1 forces one task per expert. Unset: on for AMD without
+    // AVX-512 when the misses fit in the pool (one expert, one core). IQ3_S gate/up on a 3950X, one thread:
+    // the whole expert 0.49 ms, the same rows in 16 calls 1.08 ms. A layer's few misses then cost one expert,
+    // not a slice on every core. More misses than threads keep the fine split (the rows are the bandwidth).
+    static const int force = [] {
+        const char* e = std::getenv("STRATA_POOL_WHOLE");
+        return (e == nullptr || e[0] == '\0') ? -1 : std::atoi(e) != 0 ? 1 : 0;
+    }();
+    const int threads = n_ + (host_works_ ? 1 : 0);
+    if (tasks_ == 0 && experts > 0 && experts <= threads && rows >= experts &&
+        (force == 1 || (force < 0 && amd_no_avx512())))
+        return experts;
+    return phase_tasks(rows);
+}
+
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
     const auto t0 = std::chrono::steady_clock::now();
@@ -1365,7 +1401,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         mrows_ = (int64_t) nb * f.n_ff;
-        mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, nb) : phase_tasks(mrows_);
+        mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, nb) : whole_expert_tasks(mrows_, nb);
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
@@ -1375,7 +1411,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * f.n_embd;
-        mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, nb) : phase_tasks(mrows_);
+        mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, nb) : whole_expert_tasks(mrows_, nb);
         run_phase(6, mtasks_);
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();

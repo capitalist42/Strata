@@ -285,6 +285,8 @@ public:
 
 private:
     int phase_tasks(int64_t rows) const;
+    /// One task per expert when a sliced expert is slower than the whole one (AMD, no AVX-512). Else `phase_tasks`.
+    int whole_expert_tasks(int64_t rows, int experts) const;
     int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
